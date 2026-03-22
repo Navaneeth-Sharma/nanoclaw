@@ -10,22 +10,24 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
-  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
+  GITHUB_EMAIL,
+  GITHUB_TOKEN,
+  GITHUB_USER,
   IDLE_TIMEOUT,
+  OPENCODE_GO_API_KEY,
+  OPENCODE_MODEL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -64,6 +66,19 @@ function buildVolumeMounts(
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 
+  // Ensure AGENTS.md exists in group folder (OpenCode reads AGENTS.md, not CLAUDE.md)
+  // Create a symlink AGENTS.md -> CLAUDE.md so both names work transparently
+  const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
+  const agentsMdPath = path.join(groupDir, 'AGENTS.md');
+  if (fs.existsSync(claudeMdPath) && !fs.existsSync(agentsMdPath)) {
+    try {
+      fs.symlinkSync('CLAUDE.md', agentsMdPath);
+    } catch {
+      // If symlink fails (e.g. on FAT32), do a file copy instead
+      fs.copyFileSync(claudeMdPath, agentsMdPath);
+    }
+  }
+
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
     // (group folder, IPC, .claude/) are mounted separately below.
@@ -77,7 +92,8 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the credential proxy, never exposed to containers.
+    // Credentials are never exposed to containers directly.
+    // OPENCODE_GO_API_KEY is injected separately via the env args below.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -190,7 +206,7 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -222,20 +238,22 @@ function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // Inject OpenCode Go API key for model access
+  if (OPENCODE_GO_API_KEY) {
+    args.push('-e', `OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY}`);
+  }
+  // Model selection (defaults to opencode-go/glm-5 if not set)
+  args.push('-e', `OPENCODE_MODEL=${OPENCODE_MODEL}`);
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  // GitHub credentials — allows the agent to commit, push, and open PRs
+  if (GITHUB_TOKEN) {
+    args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
+  }
+  if (GITHUB_USER) {
+    args.push('-e', `GITHUB_USER=${GITHUB_USER}`);
+  }
+  if (GITHUB_EMAIL) {
+    args.push('-e', `GITHUB_EMAIL=${GITHUB_EMAIL}`);
   }
 
   // Runtime-specific args for host gateway resolution
